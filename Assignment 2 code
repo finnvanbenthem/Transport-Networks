@@ -1,1 +1,784 @@
+# CIEQ6232 Public Transport Demand and Network Planning and Operations
+### Pre-requisites
+%%capture
+%run utils.py # Load auxiliary functions
+# Show maps inline
+from bokeh.resources import INLINE
+import bokeh.io
+bokeh.io.output_notebook(INLINE)
+### Note: you can ignore the following error if it occurs: "Javascript Error: assigment to undeclared variable jQuery"
+----
+# Graph processing
+### Parameters
+Update the following parameters based on the city you chosed
+path_to_sqlite="sydney-train.sqlite" # Path where the sqlite database is stored
+
+### Load GTFS data
+g=load_gtfs(path_to_sqlite)
+### Generate L-space
+#Get available modes for the city
+[mode_to_string(x) for x in g.get_modes()]
+#Generate networkX graph
+L=generate_graph(g,
+               "Rail", # Chosen mode from previous list
+                start_hour=5, # Consider trips from 5am...
+                end_hour=24) #  ... to midnight
+plot_graph(L, back_map="OSM")
+#### Understanding nodes and edges
+Each node has an ID and a dictionary of attributes, including the latitude and longitude (coordinates) and a given name.
+
+An edge is a triplet (n1,n2,attrs), where n1 is the ID of the origin stop, n2 is the ID of the destination stop, and attrs is a dictionary with the attributes of the edge, including:
+- duration_avg: the average time in seconds to travel the edge
+- d: the length in meters of the edge
+- n_vehicles: the total number of vehicles that pass through the edge in the studied period
+- route_I_counts: same as n_vehicles but split by line_id
+#An example node
+list(L.nodes(data=True))[0]
+#An example edge
+list(L.edges(data=True))[0]
+### Automatic merge
+In this step, all stops with the exact same name are merged if (and only if) they are not farther away than **delta** meters
+L_merged=merge_stops_with_same_name(L,delta=200) #Same name and closer to 200m
+plot_graph(L_merged, back_map="OSM")
+### Remove islands 
+In this step, disconnected stops are removed from the graph. This should be a rare case, e.g., new stops that are currently being built.
+check_islands(L_merged)
+### Merge recommender
+In this step possible nodes to merge are recommended and user needs to confirm (Y) or skip (N) the suggestion.
+The suggestions are based on a combination of the similarity between the names of the stops (0-100) and on the proximity of the stops
+#### 1st round ####
+# Almost overlapping stops (20m) regardless of shared name
+string_match=0 
+stop_distance=20 
+merge_recommender(L_merged,
+                    string_match, 
+                    stop_distance)
+
+#### 2nd round ####
+# Stops with at least 75% of similarity in names and closer to 500m
+string_match=75 
+stop_distance=500
+merge_recommender(L_merged,
+                    string_match, 
+                    stop_distance)
+### Manual merge
+Click on two stops (holding shift) and then click on Merge button to merge stops. The last selected stop is merged into the first selected stop.
+manual_merge(L_merged,
+            jupyter_url="http://localhost:8888") #Change the port number if you're running in a different port
+### Sanity check
+This function prints some useful information that might help further cleaning the graph
+sanity_check(L_merged)
+### Save L-space graph
+save_graph(L_merged,"sydney-train.pkl") # Change to desired path
+----
+# Assignment 1
+Now that you have your cleaned L-space graph....
+### Parameters
+Update the following parameters based on the city you chosed
+path_to_sqlite="sydney-train.sqlite" # Path where the sqlite database is stored
+L_space_path="sydney-train.pkl" # Path where the clean L-space graph was stored
+### Load GTFS data
+g=load_gtfs(path_to_sqlite)
+
+#Get available modes for the city
+[mode_to_string(x) for x in g.get_modes()]
+### Load L-space graph
+L_graph=load_graph(L_space_path)
+### Create P-space 
+P=P_space(g,
+          L_graph,
+          start_hour=5, # Same as when building L-space
+          end_hour=24, # Same as when building L-space
+          mode="Rail") # Same as when building L-space
+
+plot_graph(P,"P")
+### Compute shortests paths between all pairs of nodes.
+#### Note: this may take several minutes (depending on the size of the graph)
+For a given pair of nodes $i$ and $j$, This function computes $sp_1,\ldots, sp_m$, the $m$ shortest paths in $\mathbf{L}$-space, i.e., the shortest in terms of in-vehicle travel time, for each pair of nodes $i$ and $j$
+
+The GTC between pairs of stops accounts for initial and transfer waiting times, in-vehicle travel times, and a time-equivalent penalty cost for transfers.
+
+For each path in L-space, we compute the sum of the waiting times for each leg in the path and the number of transfers, according to the labels and number of hops of the corresponding paths in $\mathbf{P}$-space. 
+The GTC is determined by the following weighted sum:
+
+$$
+\text{GTC}({sp}_i) = \text{in-vehicle-time}({sp}_i) + \boldsymbol{\alpha} \times \text{waiting-time}({sp}_i) + \sum_{j=1}^{{\text{n-transfers}}({sp}_i)}{\beta_J}
+$$
+# Waiting penalty (multiplier)
+alpha = 2 # Waiting time is multiplied by 2
+
+# Transfer penalties in minutes. Arbitrary size of at least one element, with the minutes to add
+# for the first, second, third... transfers. 
+betas = [5,15] # 5 minutes for the first transfer, 15 minutes for any transfer after that.
+
+# Number of shortest paths to retrieve
+m = 3
+
+gtc = get_all_GTC(L_graph, P, m, alpha, betas)
+import pickle
+
+with open("gtc_results.pkl", "wb") as f:
+    pickle.dump(gtc, f)
+
+print("✅ GTC dictionary saved to gtc_results.pkl")
+
+#### Understanding the results
+
+For each pair of nodes we get as many paths as requested (or as many as available if there are fewer alternative paths).
+
+The results is a dictionary, indexed by the nodes of origin (first index) and the nodes of destination (second index). For each pair of nodes we get a list, with the alternative paths ordered by GTC.
+
+Each path is again modeled as a dictionary, including the following attributes:
+- path: the sequence of nodes in the path computed in the L-space graph
+- GTC: the GTC corresponding to that path
+- in_vehicle: the in-vehicle travel time in minutes of that path
+- waiting_time: the waiting-time in minutes of that path (from P-space)
+- n_transfers: the number of transfers of that path (hops in P-space)
+#Example: check the GTC between nodes 51 and 37
+gtc[51][37]
+### Auxiliary functions
+Here are some auxiliary functions that might be useful for all your assignments. Use them if you need to.
+#Return the average waiting time (in minutes) per line and direction
+average_waiting_time_per_line_per_direction(P)
+#Return the average speed (in km/h) for the whole network
+average_speed_network(L_graph)
+#Get dataframe with all events
+df=get_events(g,
+              mode="Rail",
+              start_hour=5,
+              end_hour=24)
+df.head()
+#Set a new attribute to edges
+nx.set_edge_attributes(L_graph, 0, 'capacity') # Set attribute "capacity" with default value 0
+#Plot the network and color nodes based on an attribute
+plot_graph(L_graph, back_map="OSM", color_by="lat")
+#Plot the network and color edges based on an attribute
+plot_graph(L_graph, back_map="OSM", edge_color_by="duration_avg")
+## Number of nodes and edges
+# Number of nodes for L space and P space
+print("Number of nodes L-space:", L_graph.number_of_nodes())
+print("Number of edges L-space:", L_graph.number_of_edges())
+
+print("Number of nodes P-space:", P.number_of_nodes())
+print("Number of edges P-space:", P.number_of_edges())
+## Diameter
+# Diameter for L space and P space (unweighted and weighted)
+print("Diameter L-space weighted:", nx.diameter(L_graph, weight="duration_avg"))
+print("Diameter L-space unweighted:", nx.diameter(L_graph))
+
+print("Diameter P-space weighted:", nx.diameter(P, weight="avg_wait"))
+print("Diameter P-space unweighted:", nx.diameter(P))
+import numpy as np
+import matplotlib.pyplot as plt
+## Average shortest path
+# Average shortest path length for L space and P space
+print("Average shortest path L-space weighted:", nx.average_shortest_path_length(L_graph, weight="duration_avg"))
+print("Average shortest path L-space unweighted:", nx.average_shortest_path_length(L_graph))
+
+print("Average shortest path P-space weighted:", nx.average_shortest_path_length(P, weight="avg_wait"))
+print("Average shortest path P-space unweighted:", nx.average_shortest_path_length(P))
+### Gamma & Alpha index
+# Connectivity or gamma index (only L-space) 
+E = L_graph.number_of_edges()
+V = L_graph.number_of_nodes()
+gamma = E / (3 * V - 6)
+print("gamma index:", gamma)
+
+# Meshedness or alpha index (only L-space) 
+alpha = (E - V + 1) / (2 * V - 5)
+print("alpha index:", alpha)
+## Degree centrality
+# Degree centrality (both L-space and P-space)
+degree_centrality_L = nx.degree_centrality(L_graph)
+degree_centrality_P = nx.degree_centrality(P)
+values_degree_centrality_L = np.array([v for v in degree_centrality_L.values()])
+values_degree_centrality_P = np.array([v for v in degree_centrality_P.values()])
+top_3_degree_centrality_L = sorted(degree_centrality_L, key=degree_centrality_L.get, reverse=True)[:3]
+top_3_degree_centrality_P = sorted(degree_centrality_P, key=degree_centrality_P.get, reverse=True)[:3]
+print(f"Average degree centrality L-space: {np.mean(values_degree_centrality_L):.4f}")
+print(f"Standard deviation degree centrality L-space: {np.std(values_degree_centrality_L):.4f}")
+print(f"Minimum value degree centrality L-space: {np.min(values_degree_centrality_L):.4f}")
+print(f"Maximum value degree centrality L-space: {np.max(values_degree_centrality_L):.4f}")
+print("The keys of the stations with the highest degree centrality values in L-space are:", top_3_degree_centrality_L)
+print()
+print(f"Average degree centrality P-space: {np.mean(values_degree_centrality_P):.4f}")
+print(f"Standard deviation degree centrality P-space: {np.std(values_degree_centrality_P):.4f}")
+print(f"Minimum value degree centrality P-space: {np.min(values_degree_centrality_P):.4f}")
+print(f"Maximum value degree centrality P-space: {np.max(values_degree_centrality_P):.4f}")
+print("The keys of the stations with the highest degree centrality values in P-space are:", top_3_degree_centrality_P)
+## Closeness centrality
+# closeness centrality for L-space and P-space (weighted and unweighted)
+
+# Unweighted
+closeness_L_u = nx.closeness_centrality(L_graph, wf_improved=True)
+closeness_P_u = nx.closeness_centrality(P, wf_improved=True)
+
+values_closeness_L_u = np.array(list(closeness_L_u.values()))
+values_closeness_P_u = np.array(list(closeness_P_u.values()))
+
+top_3_closeness_L_u = sorted(closeness_L_u, key=closeness_L_u.get, reverse=True)[:3]
+top_3_closeness_P_u = sorted(closeness_P_u, key=closeness_P_u.get, reverse=True)[:3]
+
+# Weighted
+closeness_L_w = nx.closeness_centrality(L_graph, u=None, distance='duration_avg', wf_improved=True)
+closeness_P_w = nx.closeness_centrality(P, u=None, distance='avg_wait', wf_improved=True)
+
+
+values_closeness_L_w = np.array(list(closeness_L_w.values()))
+values_closeness_P_w = np.array(list(closeness_P_w.values()))
+
+top_3_closeness_L_w = sorted(closeness_L_w, key=closeness_L_w.get, reverse=True)[:3]
+top_3_closeness_P_w = sorted(closeness_P_w, key=closeness_P_w.get, reverse=True)[:3]
+print("Unweighted:")
+print(f"The average closeness centrality for L-space: {np.mean(values_closeness_L_u):.4f}")
+print(f"The std of the closeness centrality for L-space: {np.std(values_closeness_L_u):.4f}")
+print(f"The minimum value of the closeness centrality for L-space: {np.min(values_closeness_L_u):.4f}")
+print(f"The maximum value closeness for L-space: {np.max(values_closeness_L_u):.4f}")
+print("The keys of the stations with the highest closeness centrality values in L-space are:", top_3_closeness_L_u)
+print()
+print(f"The average closeness centrality for P-space: {np.mean(values_closeness_P_u):.4f}")
+print(f"The std of the closeness centrality for P-space: {np.std(values_closeness_P_u):.4f}")
+print(f"The minimum value of the closeness centrality for P-space: {np.min(values_closeness_P_u):.4f}")
+print(f"The maximum value centrality for P-space: {np.max(values_closeness_P_u):.4f}")
+print("The keys of the stations with the highest closeness centrality values in P-space are:", top_3_closeness_P_u)
+print()
+
+print("Weighted:")
+print(f"The average closeness centrality for L-space: {np.mean(values_closeness_L_w):.4f}")
+print(f"The std of the closeness centrality for L-space: {np.std(values_closeness_L_w):.4f}")
+print(f"The minimum value of the closeness centrality for L-space: {np.min(values_closeness_L_w):.4f}")
+print(f"The maximum value closeness for L-space: {np.max(values_closeness_L_w):.4f}")
+print("The keys of the stations with the highest closeness centrality values in L-space are:", top_3_closeness_L_w)
+print()
+print(f"The average closeness centrality for P-space: {np.mean(values_closeness_P_w):.4f}")
+print(f"The std of the closeness centrality for P-space: {np.std(values_closeness_P_w):.4f}")
+print(f"The minimum value of the closeness centrality for P-space: {np.min(values_closeness_P_w):.4f}")
+print(f"The maximum value centrality for P-space: {np.max(values_closeness_P_w):.4f}")
+print("The keys of the stations with the highest closeness centrality values in P-space are:", top_3_closeness_P_w)
+## Betweenness centrality
+#betweenness centrality for L-space and P-space (weighted and unweighted)
+
+betweenness_L_u = nx.betweenness_centrality(L_graph, k=None, normalized=True, weight=None, endpoints=False, seed=None)
+betweenness_P_u = nx.betweenness_centrality(P, k=None, normalized=True, weight=None, endpoints=False, seed=None)
+values_betweenness_L_u = np.array([v for v in betweenness_L_u.values()])
+values_betweenness_P_u = np.array([v for v in betweenness_P_u.values()])
+top_3_betweenness_L_u = sorted(betweenness_L_u, key=betweenness_L_u.get, reverse=True)[:3]
+top_3_betweenness_P_u = sorted(betweenness_P_u, key=betweenness_P_u.get, reverse=True)[:3]
+
+betweenness_L_w = nx.betweenness_centrality(L_graph, k=None, normalized=True, weight='duration_avg', endpoints=False, seed=None)
+betweenness_P_w = nx.betweenness_centrality(P, k=None, normalized=True, weight='avg_wait', endpoints=False, seed=None)
+values_betweenness_L_w = np.array([v for v in betweenness_L_w.values()])
+values_betweenness_P_w = np.array([v for v in betweenness_P_w.values()])
+top_3_betweenness_L_w = sorted(betweenness_L_w, key=betweenness_L_w.get, reverse=True)[:3]
+top_3_betweenness_P_w = sorted(betweenness_P_w, key=betweenness_P_w.get, reverse=True)[:3]
+print("Unweighted:")
+print(f"The average betweenness centrality for L-space: {np.mean(values_betweenness_L_u):.4f}")
+print(f"The std of the betweenness centrality for L-space: {np.std(values_betweenness_L_u):.4f}")
+print(f"The minimum value of the betweenness centrality for L-space: {np.min(values_betweenness_L_u):.4f}")
+print(f"The maximum value centrality for L-space: {np.max(values_betweenness_L_u):.4f}")
+print("The keys of the stations with the highest betweenness centrality values in L-space are:", top_3_betweenness_L_u)
+print()
+print(f"The average betweenness centrality for P-space: {np.mean(values_betweenness_P_u):.4f}")
+print(f"The std of the betweenness centrality for P-space: {np.std(values_betweenness_P_u):.4f}")
+print(f"The minimum value of the betweenness centrality for P-space: {np.min(values_betweenness_P_u):.4f}")
+print(f"The maximum value centrality for P-space: {np.max(values_betweenness_P_u):.4f}")
+print("The keys of the stations with the highest betweenness centrality values in P-space are:", top_3_betweenness_P_u)
+print()
+print("Weighted:")
+print(f"The average betweenness centrality for L-space: {np.mean(values_betweenness_L_w):.4f}")
+print(f"The std of the betweenness centrality for L-space: {np.std(values_betweenness_L_w):.4f}")
+print(f"The minimum value of the betweenness centrality for L-space: {np.min(values_betweenness_L_w):.4f}")
+print(f"The maximum value centrality for L-space: {np.max(values_betweenness_L_w):.4f}")
+print("The keys of the stations with the highest betweenness centrality values in L-space are:", top_3_betweenness_L_w)
+print()
+print(f"The average betweenness centrality for P-space: {np.mean(values_betweenness_P_w):.4f}")
+print(f"The std of the betweenness centrality for P-space: {np.std(values_betweenness_P_w):.4f}")
+print(f"The minimum value of the betweenness centrality for P-space: {np.min(values_betweenness_P_w):.4f}")
+print(f"The maximum value centrality for P-space: {np.max(values_betweenness_P_w):.4f}")
+print("The keys of the stations with the highest betweenness centrality values in P-space are:", top_3_betweenness_P_w)
+## Histograms
+plt.hist(values_degree_centrality_L, bins=6, edgecolor='black')  # You can adjust bins as needed
+plt.title("Histogram of Degree centrality L-space")
+plt.xlabel("Value")
+plt.ylabel("Frequency")
+plt.grid(True)
+plt.show()
+plt.hist(values_degree_centrality_P, bins=50, edgecolor='black')  # You can adjust bins as needed
+plt.title("Histogram of Degree centrality P-space")
+plt.xlabel("Value")
+plt.ylabel("Frequency")
+plt.grid(True)
+plt.show()
+plt.hist(values_betweenness_L_u, bins=50, edgecolor='black')  # You can adjust bins as needed
+plt.title("Histogram of betweenness centrality L-space (unweighted)")
+plt.xlabel("Value")
+plt.ylabel("Frequency")
+plt.grid(True)
+plt.show()
+plt.hist(values_betweenness_P_u, bins=50, edgecolor='black')  # You can adjust bins as needed
+plt.title("Histogram of betweenness centrality P-space (unweighted)")
+plt.xlabel("Value")
+plt.ylabel("Frequency")
+plt.grid(True)
+plt.show()
+plt.hist(values_betweenness_L_w, bins=50, edgecolor='black')  # You can adjust bins as needed
+plt.title("Histogram of betweenness centrality L-space (weighted)")
+plt.xlabel("Value")
+plt.ylabel("Frequency")
+plt.grid(True)
+plt.show()
+plt.hist(values_betweenness_P_w, bins=50, edgecolor='black')  # You can adjust bins as needed
+plt.title("Histogram of betweenness centrality P-space (weighted)")
+plt.xlabel("Value")
+plt.ylabel("Frequency")
+plt.grid(True)
+plt.show()
+plt.hist(values_closeness_L_u, bins=50, edgecolor='black')  # You can adjust bins as needed
+plt.title("Histogram of closeness centrality L-space (unweighted)")
+plt.xlabel("Value")
+plt.ylabel("Frequency")
+plt.grid(True)
+plt.show()
+plt.hist(values_closeness_P_u, bins=50, edgecolor='black')  # You can adjust bins as needed
+plt.title("Histogram of closeness centrality L-space (unweighted)")
+plt.xlabel("Value")
+plt.ylabel("Frequency")
+plt.grid(True)
+plt.show()
+## L-space values map
+import matplotlib.pyplot as plt
+import networkx as nx
+import numpy as np
+
+# Position dictionary from node attributes (assumes longitude/latitude)
+positions = {node: (data['lon'], data['lat']) for node, data in L_graph.nodes(data=True)}
+
+def plot_centrality_map(G, centrality_dict, title):
+    values = np.array(list(centrality_dict.values()))
+    node_sizes = 200 + 1000 * (values - values.min()) / (values.ptp() + 1e-9)
+    
+    plt.figure(figsize=(12, 10))
+    nx.draw_networkx_edges(G, pos=positions, alpha=0.3)
+    nodes = nx.draw_networkx_nodes(
+        G, pos=positions,
+        node_size=node_sizes,
+        node_color=values,
+        cmap=plt.cm.viridis
+    )
+    plt.colorbar(nodes, label=title)
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+### Weighted Degree Centrality (L-space)
+degree_L_w = dict(L_graph.degree(weight='duration_avg'))
+plot_centrality_map(L_graph, degree_L_w, "Weighted Degree Centrality (L-space)")
+
+### Weighted Closeness Centrality (L-space)
+closeness_L_w = nx.closeness_centrality(L_graph, distance='duration_avg', wf_improved=True)
+plot_centrality_map(L_graph, closeness_L_w, "Weighted Closeness Centrality (L-space)")
+
+### Weighted Betweenness Centrality (L-space)
+betweenness_L_w = nx.betweenness_centrality(L_graph, weight='duration_avg', normalized=True)
+plot_centrality_map(L_graph, betweenness_L_w, "Weighted Betweenness Centrality (L-space)")
+
+# Assignment 2
+## Step 1
+import numpy as np
+import pandas as pd
+import pickle
+
+# Load GTC dictionary
+with open('gtc_results.pkl', 'rb') as f:
+    gtc = pickle.load(f)
+
+# Parameters for gravitational model
+alpha = 5
+beta = 0.1
+population = 5_000_000  # <-- Set total population here (adjust as needed)
+Q = 0.8 * 0.1 * population  # number of trips between 8-9AM
+
+# Use closeness centrality from weighted L-space
+# Make sure this is already computed in your notebook:
+# closeness_L_w = nx.closeness_centrality(L_graph, distance='duration_avg', wf_improved=True)
+
+# Step 1: Calculate q_i for each station
+closeness = closeness_L_w  # assumes closeness_L_w is in memory
+total_c = sum(closeness.values())
+
+q = {i: (ci / total_c) * Q for i, ci in closeness.items()}
+
+# Step 2: Build OD matrix using gravitational model
+stations = list(closeness.keys())
+od_matrix = pd.DataFrame(index=stations, columns=stations).fillna(0.0)
+
+for i in stations:
+    for j in stations:
+        if i == j:
+            continue
+        try:
+            t_ij = gtc[i][j][0]['in_vehicle']
+        except (KeyError, IndexError):
+            continue  # no valid path
+
+        f_ij = alpha * np.exp(-beta * t_ij)
+
+        # Compute the denominator once per i
+        denom = sum(q[k] * alpha * np.exp(-beta * gtc[i][k][0]['in_vehicle'])
+                    for k in stations if k != i and k in gtc[i] and gtc[i][k])
+
+        if denom > 0:
+            x_ij = (q[i] * f_ij / denom) * q[j]
+            od_matrix.loc[i, j] = x_ij
+
+# Save or display result
+od_matrix = od_matrix.astype(float)
+od_matrix.tail()
+
+# Convert square OD matrix → long format expected by passenger_assignment
+od_df = (
+    od_matrix
+      .stack()                         # turn values into a single column
+      .reset_index(name='demand')      # columns: level_0, level_1, demand
+      .rename(columns={'level_0':'origin',
+                       'level_1':'destination'})
+      .query('demand > 0')             # drop zero-flow pairs (optional)
+)
+
+## Step 2
+# STEP 2 ─ Passenger assignment (8-9 AM peak)
+
+import pickle
+import numpy as np
+import pandas as pd
+from collections import Counter
+from pathlib import Path
+
+# ------------------------------------------------------------------
+# 1. Load the pre-computed k-shortest-path catalogue  (k = 3)
+# ------------------------------------------------------------------
+with open(Path("gtc_results.pkl"), "rb") as fh:
+    k_paths_dict = pickle.load(fh)          # nested dict: k_paths_dict[o][d] = [path1, path2, path3]
+
+# ------------------------------------------------------------------
+# 2. Behavioural parameters  (logit utility function)
+# ------------------------------------------------------------------
+beta_I = -0.10                    # in-vehicle time disutility  (min⁻¹)   –– given
+waiting_penalty   = 2.5           # passengers feel waiting ≈2–3× worse than IVT   :contentReference[oaicite:0]{index=0}
+transfer_equiv_IVT = 10           # one transfer ≈ 10 min of IVT disutility          :contentReference[oaicite:1]{index=1}
+
+beta_W = waiting_penalty   * beta_I     # → -0.25
+beta_T = transfer_equiv_IVT * beta_I     # → -1.00
+
+# ------------------------------------------------------------------
+# 3. Logit assignment helper
+# ------------------------------------------------------------------
+def passenger_assignment(od_matrix, k_paths, beta_I, beta_W, beta_T):
+    """
+    Probabilistic assignment of OD demand to network links
+    using a multinomial-logit choice over the k = 3 shortest paths.
+    
+    Returns
+    -------
+    link_loads : Counter  {(u, v): passengers}
+    path_flows : dict     {o: {d: [ {..., flow=<pax>} ]}}
+    """
+    # make an iterable (o, d, demand)
+    if isinstance(od_matrix, dict):
+        od_iter = [(o, d, flow)
+                   for o, dests in od_matrix.items()
+                   for d, flow in dests.items() if flow > 0]
+    else:                                   # assume DataFrame with cols origin, destination, demand
+        od_iter = od_matrix.itertuples(index=False, name=None)
+    
+    link_loads = Counter()
+    path_flows = {}
+    
+    for o, d, Q in od_iter:
+        # skip pairs w/o a path catalogue
+        if Q <= 0 or o not in k_paths or d not in k_paths[o]:
+            continue
+        
+        paths = k_paths[o][d]               # list of ≤3 dicts
+        
+        # utility & choice prob for every path
+        U      = np.array([ beta_I*p['in_vehicle']
+                            + beta_W*p['waiting_time']
+                            + beta_T*p['n_transfers']        for p in paths ])
+        exp_U  = np.exp(U - U.max())        # numeric stability
+        probs  = exp_U / exp_U.sum()
+        
+        # store flows
+        path_flows.setdefault(o, {})[d] = []
+        for p_dict, P in zip(paths, probs):
+            flow = Q * P                    # pax choosing this path
+            path_flows[o][d].append({**p_dict, "flow": flow})
+            
+            # add to directed-edge counters
+            for u, v in zip(p_dict["path"][:-1], p_dict["path"][1:]):
+                link_loads[(u, v)] += flow
+    
+    return link_loads, path_flows
+
+# ------------------------------------------------------------------
+# 4. Run the assignment
+#     (od_df was produced befre)
+# ------------------------------------------------------------------
+link_loads, path_flows = passenger_assignment(
+    od_df, k_paths_dict,
+    beta_I=beta_I, beta_W=beta_W, beta_T=beta_T
+)
+
+print(f"Assigned demand on {len(link_loads):,} directed edges.")
+
+# ------------------------------------------------------------------
+# 5. Save outputs for the next steps (capacity sizing, plotting, …)
+# ------------------------------------------------------------------
+link_load_df = pd.DataFrame(
+    [(u, v, load) for (u, v), load in link_loads.items()],
+    columns=["u", "v", "passengers"]
+)
+link_load_df.to_csv("link_loads_peak.csv", index=False)
+print("→ link_loads_peak.csv written ✅")
+
+#Nice— this message means the logit assignment ran start-to-finish and wrote a CSV that lists the peak-hour passenger load on every directed edge that was actually used.
+#What “502 directed edges” tells you
+#Your whole network graph probably has many more edges; only 502 of them carry demand in the 8–9 AM OD matrix you just modelled.
+#That number is perfectly plausible if
+#a fair share of link pairs are slow (and therefore never appear in the 3-shortest-path catalogue), or
+#some stations exchange very little demand in the gravitational model.
+#If you’d like to sanity-check things, here are a few quick diagnostics you can paste right below the assignment cell.
+# --- quick checks & summaries --------------------------------------
+import pandas as pd
+
+# 1. How much demand did we start with?
+total_demand = od_df['demand'].sum()     # or sum(q.values()) if you kept OD in dict form
+print(f"Total OD demand (pax): {total_demand:,.0f}")
+
+# 2. What’s the busiest 10 edges?
+link_load_df.sort_values('passengers', ascending=False).head(10)
+
+# 3. Visual feel: histogram of edge loads
+import matplotlib.pyplot as plt
+plt.figure()
+link_load_df['passengers'].plot(kind='hist', bins=30)
+plt.xlabel('Passengers on edge (8-9 AM)')
+plt.ylabel('Number of edges')
+plt.title('Load distribution')
+plt.show()
+
+# Pick a random origin
+o = next(iter(k_paths_dict))
+lens = [len(paths) for paths in k_paths_dict[o].values()]
+print("Origin", o, "has these counts of paths:", set(lens))
+# Expect to see {3} (or {2,3}) – anything else means fewer than 3 exist for some pairs.
+
+import numpy as np
+
+counts = [len(paths) for o in k_paths_dict for paths in k_paths_dict[o].values()]
+unique, freq = np.unique(counts, return_counts=True)
+
+print("Path counts across all O-D pairs:")
+for c, f in zip(unique, freq):
+    print(f"  {c} path(s): {f:,} pairs  ({f/sum(freq):.1%})")
+## Step 3
+G = L_graph
+import sqlite3, pandas as pd, numpy as np
+from pathlib import Path
+
+path_to_sqlite = Path(r"C:\Users\phili\OneDrive\Documenten\Studie\TU Delft\Master\Jaar 1\Periode 4\CIEQ6232 Public Transport Demand (U2)\sydney-train.sqlite")
+WIN_START, WIN_END = 8*3600, 9*3600      # seconds since midnight
+
+sql = f"""
+SELECT trip_I AS trip,
+       stop_I AS stop,
+       dep_time_ds AS dep_sec,
+       seq
+FROM   stop_times
+WHERE  dep_sec BETWEEN {WIN_START} AND {WIN_END-1};
+"""
+peak_st = pd.read_sql_query(sql, sqlite3.connect(path_to_sqlite, uri=True))
+peak_st = peak_st.sort_values(['trip', 'seq'])
+peak_st['next_stop'] = peak_st.groupby('trip')['stop'].shift(-1)
+
+edges = (peak_st.dropna(subset=['next_stop'])
+                 .loc[:, ['stop', 'next_stop']]
+                 .astype(int)
+                 .rename(columns={'stop':'u', 'next_stop':'v'}))
+
+edge_freq_df = (edges.value_counts()
+                      .reset_index(name='trips'))          # u, v, trips
+print(f"{len(edge_freq_df):,} edges have ≥1 vehicle 08-09 AM")
+
+# Build a many-to-one lookup from GTFS stop code → graph node index
+stop_to_node = {}
+for node, data in G.nodes(data=True):
+    if 'original_ids' in data:             # this key holds the GTFS stop codes
+        for sid in data['original_ids']:
+            stop_to_node[int(sid)] = node
+
+# Apply the mapping to edge_freq_df
+edge_freq_df['u'] = edge_freq_df['u'].map(stop_to_node)
+edge_freq_df['v'] = edge_freq_df['v'].map(stop_to_node)
+edge_freq_df = edge_freq_df.dropna().astype({'u':int, 'v':int})[['u','v','trips']]
+
+print("edge_freq_df after mapping:", edge_freq_df.shape)
+
+import pandas as pd
+link_load_df = pd.read_csv("link_loads_peak.csv")          # from Step 2
+
+df = (link_load_df.merge(edge_freq_df, on=['u','v'], how='inner'))
+df['avg_load'] = df['passengers'] / df['trips']
+df = df[df['avg_load'].notna()]        # keep edges with ≥1 vehicle
+
+print("Edges with both load & freq:", len(df))
+
+import numpy as np, matplotlib.pyplot as plt
+loads = np.sort(df['avg_load'])
+cdf   = np.arange(1, len(loads)+1) / len(loads)
+
+plt.figure()
+plt.step(loads, cdf, where='post')
+plt.xlabel('Average load per vehicle (pax, 08–09)')
+plt.ylabel('Cumulative share of edges')
+plt.title('Empirical CDF – per-vehicle load')
+plt.grid(True)
+
+DESIGN_PCT = 95                      # tweak 85-98 to suit your trade-off
+capacity   = int(np.ceil(np.percentile(loads, DESIGN_PCT) / 5) * 5)
+plt.axvline(capacity, ls='--')
+plt.text(capacity, 0.5,
+         f'{DESIGN_PCT}th pct → {capacity} pax',
+         rotation=90, va='center')
+plt.show()
+
+print(f"\nProposed uniform vehicle capacity ≈ {capacity} passengers "
+      f"(covers {DESIGN_PCT}% of link-hours without crowding).")
+
+print(df['avg_load'].describe(percentiles=[.5,.9,.95,.99]))
+
+## Step 4
+# STEP 4 ─ Analyse network performance
+# ------------------------------------
+import pandas as pd, numpy as np, matplotlib.pyplot as plt
+import networkx as nx
+
+# -------------------------------------------------
+# 1.  Build a dataframe with saturation per edge
+# -------------------------------------------------
+df_sat = (link_load_df
+            .merge(edge_freq_df, on=['u','v'], how='left')
+            .dropna(subset=['trips']))                       # drop edges with no scheduled vehicles
+
+df_sat['edge_capacity'] = df_sat['trips'] * capacity        # seats (or places) per hour
+df_sat['saturation']    = df_sat['passengers'] / df_sat['edge_capacity']
+
+print(df_sat[['passengers','edge_capacity','saturation']].describe(percentiles=[.5,.9,.95,.99]))
+
+# -------------------------------------------------
+# 2.  Quick map: colour edges by saturation level
+# -------------------------------------------------
+# choose a diverging colour map (blue→green→red)
+cmap   = plt.cm.get_cmap('RdYlGn_r')        # reversed so red = high sat
+sat_clipped = df_sat['saturation'].clip(upper=2.0)  # cap at 200 % for colour scaling
+norm   = plt.Normalize(vmin=0, vmax=2.0)
+
+plt.figure(figsize=(10,8))
+ax = plt.gca()
+
+for (_, row) in df_sat.iterrows():
+    u, v = int(row['u']), int(row['v'])
+    x0, y0 = G.nodes[u]['lon'], G.nodes[u]['lat']
+    x1, y1 = G.nodes[v]['lon'], G.nodes[v]['lat']
+    ax.plot([x0, x1], [y0, y1],
+            color=cmap(norm(row['saturation'])),
+            linewidth=2)
+
+plt.title('Link saturation (volume / capacity) – 08:00–09:00')
+sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+sm.set_array([])
+cbar = plt.colorbar(sm, ax=ax, label='saturation ratio')
+cbar.set_ticks([0,0.5,1,1.5,2])
+plt.xlabel('Longitude'); plt.ylabel('Latitude')
+plt.axis('equal'); plt.show()
+
+# -------------------------------------------------
+# 3.  Passenger-level KPIs from path_flows
+# -------------------------------------------------
+tot_flow = 0
+tot_ivt  = tot_wait = tot_transfers = 0
+ivt_values, wait_values = [], []     # for min/max
+
+for o_dict in path_flows.values():
+    for paths in o_dict.values():
+        for p in paths:
+            q      = p['flow']
+            tot_flow      += q
+            tot_ivt       += p['in_vehicle']   * q
+            tot_wait      += p['waiting_time'] * q
+            tot_transfers += p['n_transfers']  * q
+            ivt_values.append((p['in_vehicle'], q))
+            wait_values.append((p['waiting_time'], q))
+
+avg_ivt   = tot_ivt  / tot_flow
+avg_wait  = tot_wait / tot_flow
+avg_trans = tot_transfers / tot_flow
+
+# weighted min / max
+ivt_min = min(ivt_values, key=lambda x: x[0])[0]
+ivt_max = max(ivt_values, key=lambda x: x[0])[0]
+
+print("\nPassenger-related KPIs (08-09 AM)")
+print(f"  • Average in-vehicle time      : {avg_ivt:5.1f} min")
+print(f"    – minimal / maximal IVT      : {ivt_min:5.1f} / {ivt_max:5.1f} min")
+print(f"  • Average waiting time         : {avg_wait:5.1f} min")
+print(f"  • Average # transfers per trip : {avg_trans:4.2f}")
+
+## Step 5
+### Step 5.1
+import networkx as nx
+import numpy as np
+
+# 1️⃣ weighted closeness centrality (P-space, distance = in-vehicle time)
+centrality = nx.closeness_centrality(G, distance='in_vehicle')
+
+# 2️⃣ top-3 nodes to remove
+remove_nodes = sorted(centrality, key=centrality.get, reverse=True)[:3]
+print("Nodes to remove:", remove_nodes)
+
+# 3️⃣ make a *copy* of the graph and remove those nodes
+G_removed = G.copy()
+G_removed.remove_nodes_from(remove_nodes)
+
+### Step 5.2
+# --- connectivity test ------------------------------------------------
+U = G_removed.to_undirected()                 # ignore direction for connectivity
+is_conn = nx.is_connected(U)                   # True  → still one piece
+
+if is_conn:
+    print("✅  Attacked network **remains connected** "
+          f"({U.number_of_nodes()} nodes, {U.number_of_edges()} edges)")
+    G_main = G_removed.copy()                 # keep the full graph
+else:
+    # identify all weakly connected components
+    components = sorted(nx.connected_components(U), key=len, reverse=True)
+    print(f"⚠️  Network broke into {len(components)} components "
+          f"after removing the three central nodes.")
+    for i, comp in enumerate(components[:5], 1):   # print first few sizes
+        print(f"   component {i}: {len(comp)} nodes")
+    
+    # retain the giant component only (as requested by the assignment)
+    main_comp = components[0]
+    G_main    = G_removed.subgraph(main_comp).copy()
+    print(f"   → continuing analysis on the largest one "
+          f"({len(G_main)} nodes, {G_main.number_of_edges()} edges)")
+
+# work on an *undirected* view to catch weak connectivity
+components = sorted(nx.connected_components(G_removed.to_undirected()),
+                    key=len, reverse=True)
+main_comp  = components[0]
+G_main     = G_removed.subgraph(main_comp).copy()
+
+print(f"Largest sub-network kept: {len(G_main)} nodes, "
+      f"{G_main.number_of_edges()} edges")
+
 
